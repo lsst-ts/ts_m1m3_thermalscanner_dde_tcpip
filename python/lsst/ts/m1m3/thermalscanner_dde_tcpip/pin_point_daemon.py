@@ -25,6 +25,7 @@ import asyncio
 import logging
 
 import win32ui  # noqa: F401
+from lsst.ts import tcpip
 
 from . import __version__
 
@@ -32,20 +33,35 @@ from . import __version__
 import dde  # isort: skip
 
 
-logger = logging.getLogger(__name__)
-
-
-class PinPointDaemon:
+class PinPointDaemon(tcpip.OneClientReadLoopServer):
     """Daemon to readout PinPoint temperature values.
 
     Parameters
     ----------
     index : `int`
+    port : `int`
+        IP port for this server. If 0 then use a random port.
+    simulation_mode : `int`, optional
+        Simulation mode. The default is 0: do not simulate
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        index: int,
+        host: None | str,
+        port: int,
+        log: logging.Logger,
+        simulation_mode: int,
+    ) -> None:
+        self.log = log
         self._server: dde.PyDDEServer | None = None
         self._pin_point: dde.PyDDEConv | None = None
+
+        self.connect()
+
+        super().__init__(
+            f"M1M3_ThermalScanner_{index}", host, port, log, simulation_mode
+        )
 
     def connect(self) -> None:
         self._server = dde.CreateServer()
@@ -54,37 +70,42 @@ class PinPointDaemon:
         self._pin_point = dde.CreateConversation(self._server)
         self._pin_point.ConnectTo("PPMonitor", "System")
 
-        logger.info("Requesting PPMonitor topics")
+        self.log.info("Requesting PPMonitor topics")
         topics = self._pin_point.Request("Topics").split("\t")
 
-        logger.debug("PPMonitor System's topics: %s", ",".join(topics))
+        self.log.debug("PPMonitor System's topics: %s", ",".join(topics))
 
         system = topics[0]
 
         self._pin_point.ConnectTo("PPMonitor", system)
 
-        logger.info("Connected to %s", system)
+        self.log.info("Connected to %s", system)
 
-    async def run_loop(self) -> None:
+    async def read_and_dispatch(self) -> None:
         assert self._pin_point is not None
 
         scan_time = float(self._pin_point.Request("Average Scan Interval"))
-        while True:
-            temperatures = self._pin_point.Request("Temperatures").split("\t")[:-1]
-            logger.info("Temperatures: %s", ",".join(temperatures))
 
-            temp = [float(s) for s in temperatures]
-            print(len(temp), temp)
+        async with self.create_server(
+            conect_callback=self.connect_callback
+        ) as server, self.create_client(server) as client:
+            await self.assert_next_connected(True)
+            while True:
+                temperatures = self._pin_point.Request("Temperatures").split("\t")[:-1]
+                self.log.debug("Temperatures: %s", ",".join(temperatures))
 
-            await asyncio.sleep(scan_time)
+                await client.write_str(line=",".join(temperatures))
+
+                await asyncio.sleep(scan_time)
 
 
 def run_pin_point_daemon() -> None:
     """Run the Pin Point Daemon."""
     logging.basicConfig(level=logging.INFO)
-    logger.info("Starting PinPoint Daemon %s", __version__)
 
-    daemon = PinPointDaemon()
-    daemon.connect()
+    log = logging.getLogger(__name__)
+    log.info("Starting PinPoint Daemon %s", __version__)
+
+    daemon = PinPointDaemon(2, None, 2222, log, 0)
 
     asyncio.run(daemon.run_loop())
