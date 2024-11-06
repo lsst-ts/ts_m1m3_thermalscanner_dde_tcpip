@@ -10,7 +10,6 @@ classifiers = [ "Programming Language :: Python :: 3" ]
 urls = { documentation = "https://ts-m1m3-thermalscanner-dde-tcpip.lsst.io", repository = "https://github.com/lsst-ts/ts_m1m3_thermalscanner_dde_tcpip" }
 dynamic = [ "version" ]
 dependencies = [
-  "ts_tcpip",
   "pywin32",
 ]
 
