@@ -24,6 +24,7 @@ __all__ = ["PinPointDaemon", "run_pin_point_daemon"]
 import asyncio
 import logging
 import socket
+import subprocess
 import sys
 
 import win32ui  # noqa: F401
@@ -52,22 +53,21 @@ class PinPointDaemon:
         host: None | str,
         port: int,
         log: logging.Logger,
-        simulation_mode: int,
     ) -> None:
         self.log = log
         self._server: dde.PyDDEServer | None = None
         self._pin_point: dde.PyDDEConv | None = None
 
-        self.connect()
-
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
         if host is None:
             host = ""
+        self.port = port
 
-        self.socket.bind((host, port))
+        self.socket.bind((host, self.port))
+        self.socket.listen(1)
 
-    def connect(self) -> None:
+    async def connect(self) -> None:
         self._server = dde.CreateServer()
         self._server.Create("Daemon")
 
@@ -82,32 +82,50 @@ class PinPointDaemon:
         # system = topics[0]
         system = sys.argv[1]
 
-        self._pin_point.ConnectTo("PPMonitor", system)
+        self.log.debug("Connecting to %s.", system)
+        try:
+            self._pin_point.ConnectTo("PPMonitor", system)
+        except Exception as ex:
+            self.log.error("Cannot connect to %s. The error was: %s", system, str(ex))
+            sys.exit(1)
 
         self.log.info("Connected to %s", system)
+
+    async def run(self) -> None:
+        try:
+            await self.connect()
+        except Exception:
+            self.log.info("Starting PinPoint monitor")
+            subprocess.Popen(["C:\\Program Files (x86)\\GEC\\PinPoint\\PPMonitor.exe"])
+            await asyncio.sleep(5)
+            await self.connect()
+
+        assert self._pin_point is not None
+
+        self.scan_time = float(self._pin_point.Request("Average Scan Interval"))
+
+        while True:
+            await self.run_loop()
 
     async def run_loop(self) -> None:
         assert self._pin_point is not None
 
-        scan_time = float(self._pin_point.Request("Average Scan Interval"))
+        self.log.info("Accepting connection on port %d.", self.port)
+        connection, client_address = self.socket.accept()
+        try:
+            self.log.info("Client connected, client address is %s", client_address)
+            while True:
+                temperatures = self._pin_point.Request("Temperatures").split("\t")[:-1]
+                self.log.debug("Temperatures: %s", ",".join(temperatures))
 
-        self.socket.listen(1)
-
-        while True:
-            connection, client_address = self.socket.accept()
-            try:
-                self.log.info("Client connected, client address is %s", client_address)
-                while True:
-                    temperatures = self._pin_point.Request("Temperatures").split("\t")[
-                        :-1
-                    ]
-                    self.log.debug("Temperatures: %s", ",".join(temperatures))
-
-                    connection.sendall(bytes(",".join(temperatures) + "\r\n", "ascii"))
-                    await asyncio.sleep(scan_time)
-            finally:
-                self.log.info("Client connection from %s closed.", client_address)
-                connection.close()
+                connection.sendall(bytes(",".join(temperatures) + "\r\n", "ascii"))
+                await asyncio.sleep(self.scan_time)
+        except ConnectionAbortedError as ex:
+            self.log.info(
+                "Client connection from %s closed: %s.", client_address, str(ex)
+            )
+        finally:
+            connection.close()
 
 
 def run_pin_point_daemon() -> None:
@@ -117,5 +135,5 @@ def run_pin_point_daemon() -> None:
     log = logging.getLogger(__name__)
     log.info("Starting PinPoint Daemon %s", __version__)
 
-    daemon = PinPointDaemon(2, None, 2222, log, 0)
-    asyncio.run(daemon.run_loop())
+    daemon = PinPointDaemon(2, None, 2222, log)
+    asyncio.run(daemon.run())
