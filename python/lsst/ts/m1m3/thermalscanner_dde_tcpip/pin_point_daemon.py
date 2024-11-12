@@ -21,6 +21,7 @@
 
 __all__ = ["PinPointDaemon", "run_pin_point_daemon"]
 
+import argparse
 import asyncio
 import logging
 import socket
@@ -40,7 +41,6 @@ class PinPointDaemon:
 
     Parameters
     ----------
-    index : `int`
     port : `int`
         IP port for this server. If 0 then use a random port.
     simulation_mode : `int`, optional
@@ -49,11 +49,14 @@ class PinPointDaemon:
 
     def __init__(
         self,
-        index: int,
+        ppmonitor_exe: str,
         host: None | str,
         port: int,
+        ppmonitor_topic: None | str,
         log: logging.Logger,
     ) -> None:
+        self.ppmonitor_exe = ppmonitor_exe
+        self.ppmonitor_topic = ppmonitor_topic
         self.log = log
         self._server: dde.PyDDEServer | None = None
         self._pin_point: dde.PyDDEConv | None = None
@@ -67,36 +70,46 @@ class PinPointDaemon:
         self.socket.bind((host, self.port))
         self.socket.listen(1)
 
-    async def connect(self) -> None:
         self._server = dde.CreateServer()
-        self._server.Create("Daemon")
+        self._server.Create("ThermalScannerDaemon")
 
+    async def connect(self) -> None:
         self._pin_point = dde.CreateConversation(self._server)
-        self._pin_point.ConnectTo("PPMonitor", "System")
 
-        # self.log.info("Requesting PPMonitor topics")
-        # topics = self._pin_point.Request("Topics").split("\t")
+        if self.ppmonitor_topic is None:
+            self._pin_point.ConnectTo("PPMonitor", "System")
 
-        # self.log.debug("PPMonitor System's topics: %s", ",".join(topics))
+            self.log.info(
+                "Requesting PPMonitor topics. This probably doesn't work on Windows 11, "
+                "shall work on Windows 10 and earlier."
+            )
+            topics = self._pin_point.Request("Topics").split("\t")
 
-        # system = topics[0]
-        system = sys.argv[1]
+            self.log.debug("PPMonitor System's topics: %s", ",".join(topics))
+
+            system = topics[0]
+        else:
+            system = self.ppmonitor_topic
 
         self.log.debug("Connecting to %s.", system)
         try:
             self._pin_point.ConnectTo("PPMonitor", system)
         except Exception as ex:
-            self.log.error("Cannot connect to %s. The error was: %s", system, str(ex))
-            sys.exit(1)
+            raise RuntimeError(f"Cannot connect to {system}: {str(ex)}")
 
         self.log.info("Connected to %s", system)
 
     async def run(self) -> None:
         try:
             await self.connect()
-        except Exception:
-            self.log.info("Starting PinPoint monitor")
-            subprocess.Popen(["C:\\Program Files (x86)\\GEC\\PinPoint\\PPMonitor.exe"])
+        except Exception as ex:
+            if self.ppmonitor_exe == "":
+                raise RuntimeError(
+                    "PPMonitor is not running and path to its binary was not provided, exiting."
+                    "The error was: " + str(ex)
+                )
+            self.log.info("Starting PinPoint monitor: %s", self.ppmonitor_exe)
+            subprocess.Popen([self.ppmonitor_exe])
             await asyncio.sleep(5)
             await self.connect()
 
@@ -132,8 +145,54 @@ def run_pin_point_daemon() -> None:
     """Run the Pin Point Daemon."""
     logging.basicConfig(level=logging.INFO)
 
+    parser = argparse.ArgumentParser(
+        description="Server  temperatures retrieved through DDE from the PinPoint Monitor."
+    )
+
+    default_exe = "C:\\Program Files (x86)\\GEC\\PinPoint\\PPMonitor.exe"
+
+    parser.add_argument(
+        "--ppmonitor-exe",
+        default=default_exe,
+        help="Location of the PinPoint Monitor exe. Default is " + default_exe,
+    )
+
+    parser.add_argument(
+        "--port", default=4447, type=int, help="Port on which data will be served."
+    )
+
+    parser.add_argument(
+        "--discover",
+        default=False,
+        type=bool,
+        help=(
+            "Auto discover topic in the PPPMonitor. Defaults to false, then ppmonitor-topic "
+            "has to be provide."
+        ),
+    )
+
+    parser.add_argument(
+        "--ppmonitor-topic",
+        default=None,
+        type=str,
+        help="PinPoint Monitor DDE topics. Equals to project, not input monitor, filename - e.g. GE01.ppc",
+    )
+
+    args = parser.parse_args()
+
+    if args.discover is True:
+        ppmonitor_topic = None
+    else:
+        if args.ppmonitor_topic is None:
+            print(
+                "Either --discover or --ppmonitor-topic command line argument is required"
+            )
+            sys.exit(1)
+
+        ppmonitor_topic = args.ppmonitor_topic
+
     log = logging.getLogger(__name__)
     log.info("Starting PinPoint Daemon %s", __version__)
 
-    daemon = PinPointDaemon(2, None, 2222, log)
+    daemon = PinPointDaemon(args.ppmonitor_exe, None, args.port, ppmonitor_topic, log)
     asyncio.run(daemon.run())
