@@ -27,6 +27,8 @@ import logging
 import socket
 import subprocess
 import sys
+import time
+from typing import TextIO
 
 import win32ui  # noqa: F401
 
@@ -43,6 +45,8 @@ class PinPointDaemon:
     ----------
     port : `int`
         IP port for this server. If 0 then use a random port.
+    save_file : `argparse.FileType or None`
+        If specified, save data to the given file.
     simulation_mode : `int`, optional
         Simulation mode. The default is 0: do not simulate
     """
@@ -52,26 +56,30 @@ class PinPointDaemon:
         ppmonitor_exe: str,
         host: None | str,
         port: int,
+        save_file: None | TextIO,
         ppmonitor_topic: None | str,
         log: logging.Logger,
     ) -> None:
         self.ppmonitor_exe = ppmonitor_exe
         self.ppmonitor_topic = ppmonitor_topic
+        self.save_file = save_file
         self.log = log
         self._server: dde.PyDDEServer | None = None
         self._pin_point: dde.PyDDEConv | None = None
 
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
         if host is None:
-            host = ""
+            host = socket.gethostname()
+        self.host = host
         self.port = port
-
-        self.socket.bind((host, self.port))
-        self.socket.listen(1)
 
         self._server = dde.CreateServer()
         self._server.Create("ThermalScannerDaemon")
+
+        self._connection: None | socket.socket = None
+        self._client_address: None | str = None
+
+        self.data: None | bytes = None
+        self.events: list[asyncio.Event] = []
 
     async def connect(self) -> None:
         self._pin_point = dde.CreateConversation(self._server)
@@ -117,28 +125,57 @@ class PinPointDaemon:
 
         self.scan_time = float(self._pin_point.Request("Average Scan Interval"))
 
-        while True:
-            await self.run_loop()
+        await asyncio.gather(self.telemetry_task(), self.listen_task())
 
-    async def run_loop(self) -> None:
+    async def telemetry_task(self) -> None:
         assert self._pin_point is not None
 
-        self.log.info("Accepting connection on port %d.", self.port)
-        connection, client_address = self.socket.accept()
-        try:
-            self.log.info("Client connected, client address is %s", client_address)
-            while True:
-                temperatures = self._pin_point.Request("Temperatures").split("\t")[:-1]
-                self.log.debug("Temperatures: %s", ",".join(temperatures))
+        while True:
+            temperatures = self._pin_point.Request("Temperatures").split("\t")[:-1]
+            now = time.time()
+            print("Temperatures: ", ",".join(temperatures))
+            if self.save_file is not None:
+                self.save_file.write(str(now) + ":")
+                self.save_file.write(",".join(temperatures) + "\n")
+                self.save_file.flush()
 
-                connection.sendall(bytes(",".join(temperatures) + "\r\n", "ascii"))
-                await asyncio.sleep(self.scan_time)
-        except ConnectionAbortedError as ex:
-            self.log.info(
-                "Client connection from %s closed: %s.", client_address, str(ex)
-            )
+            self.data = bytes(str(now) + ":" + ",".join(temperatures) + "\r\n", "ascii")
+            for event in self.events:
+                event.set()
+
+            print("Sleep for", self.scan_time)
+
+            await asyncio.sleep(self.scan_time)
+
+    async def handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        self.log.info("Connected %s", writer.get_extra_info("peername"))
+        event = asyncio.Event()
+        try:
+            self.events.append(event)
+            while True:
+                await event.wait()
+                if self.data is None:
+                    return
+                writer.write(self.data)
+                await writer.drain()
+                event.clear()
         finally:
-            connection.close()
+            self.events.remove(event)
+
+    async def listen_task(self) -> None:
+        try:
+            self.log.info("Accepting connection on port %s:%d.", self.host, self.port)
+            server = await asyncio.start_server(
+                self.handle_client, self.host, self.port
+            )
+            self.log.info("Serving")
+            await server.serve_forever()
+        except Exception as ex:
+            self.log.error("Exception in listen_task: %s", str(ex))
+        finally:
+            self.log.warn("Exiting from listen task")
 
 
 def run_pin_point_daemon() -> None:
@@ -178,7 +215,25 @@ def run_pin_point_daemon() -> None:
         help="PinPoint Monitor DDE topics. Equals to project, not input monitor, filename - e.g. GE01.ppc",
     )
 
+    parser.add_argument(
+        "--save",
+        default=None,
+        type=argparse.FileType("w"),
+        help="Save telemetry to given file",
+    )
+
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        default=False,
+        action="store_true",
+        help="Be verbose - print debug messages",
+    )
+
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
 
     if args.discover is True:
         ppmonitor_topic = None
@@ -194,5 +249,7 @@ def run_pin_point_daemon() -> None:
     log = logging.getLogger(__name__)
     log.info("Starting PinPoint Daemon %s", __version__)
 
-    daemon = PinPointDaemon(args.ppmonitor_exe, None, args.port, ppmonitor_topic, log)
+    daemon = PinPointDaemon(
+        args.ppmonitor_exe, None, args.port, args.save, ppmonitor_topic, log
+    )
     asyncio.run(daemon.run())
