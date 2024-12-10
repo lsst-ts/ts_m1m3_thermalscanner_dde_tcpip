@@ -43,6 +43,8 @@ class PinPointDaemon:
     ----------
     port : `int`
         IP port for this server. If 0 then use a random port.
+    save_file : `argparse.FileType or None`
+        If specified, save data to the given file.
     simulation_mode : `int`, optional
         Simulation mode. The default is 0: do not simulate
     """
@@ -52,11 +54,13 @@ class PinPointDaemon:
         ppmonitor_exe: str,
         host: None | str,
         port: int,
+        save_file: None | argparse.FileType,
         ppmonitor_topic: None | str,
         log: logging.Logger,
     ) -> None:
         self.ppmonitor_exe = ppmonitor_exe
         self.ppmonitor_topic = ppmonitor_topic
+        self.save_file = save_file
         self.log = log
         self._server: dde.PyDDEServer | None = None
         self._pin_point: dde.PyDDEConv | None = None
@@ -72,6 +76,9 @@ class PinPointDaemon:
 
         self._server = dde.CreateServer()
         self._server.Create("ThermalScannerDaemon")
+
+        self._connection = None | socket.socket
+        self._client_address = None | str
 
     async def connect(self) -> None:
         self._pin_point = dde.CreateConversation(self._server)
@@ -117,28 +124,45 @@ class PinPointDaemon:
 
         self.scan_time = float(self._pin_point.Request("Average Scan Interval"))
 
-        while True:
-            await self.run_loop()
+        await asyncio.gather(self.telemetry_task(), self.listen_task())
 
-    async def run_loop(self) -> None:
+    async def telemetry_task(self) -> None:
         assert self._pin_point is not None
 
-        self.log.info("Accepting connection on port %d.", self.port)
-        connection, client_address = self.socket.accept()
-        try:
-            self.log.info("Client connected, client address is %s", client_address)
-            while True:
-                temperatures = self._pin_point.Request("Temperatures").split("\t")[:-1]
-                self.log.debug("Temperatures: %s", ",".join(temperatures))
+        while True:
+            temperatures = self._pin_point.Request("Temperatures").split("\t")[:-1]
+            self.log.debug("Temperatures: %s", ",".join(temperatures))
+            if self.save_file is not None:
+                self.save_file.write(",".join(temperatures) + "\n")
+                self.save_file.flush()
 
-                connection.sendall(bytes(",".join(temperatures) + "\r\n", "ascii"))
-                await asyncio.sleep(self.scan_time)
-        except ConnectionAbortedError as ex:
+            if self._connection is not None:
+                try:
+                    self._connection.sendall(
+                        bytes(",".join(temperatures) + "\r\n", "ascii")
+                    )
+                except ConnectionAbortedError as ex:
+                    self.log.info(
+                        "Client connection from %s closed: %s.",
+                        self._client_address,
+                        str(ex),
+                    )
+                    self._connection.close()
+                    self._connection = None
+
+            await asyncio.sleep(self.scan_time)
+
+    async def listen_task(self) -> None:
+        assert self._pin_point is not None
+
+        while True:
+            self.log.info("Accepting connection on port %d.", self.port)
+            self._connection, self._client_address = self.socket.accept()
             self.log.info(
-                "Client connection from %s closed: %s.", client_address, str(ex)
+                "Client connected, client address is %s", self._client_address
             )
-        finally:
-            connection.close()
+            while self._connection is not None:
+                await asyncio.sleep(1)
 
 
 def run_pin_point_daemon() -> None:
@@ -178,6 +202,13 @@ def run_pin_point_daemon() -> None:
         help="PinPoint Monitor DDE topics. Equals to project, not input monitor, filename - e.g. GE01.ppc",
     )
 
+    parser.add_argument(
+        "--save",
+        default=None,
+        type=argparse.FileType("w"),
+        help="Save telemetry to given file",
+    )
+
     args = parser.parse_args()
 
     if args.discover is True:
@@ -194,5 +225,7 @@ def run_pin_point_daemon() -> None:
     log = logging.getLogger(__name__)
     log.info("Starting PinPoint Daemon %s", __version__)
 
-    daemon = PinPointDaemon(args.ppmonitor_exe, None, args.port, ppmonitor_topic, log)
+    daemon = PinPointDaemon(
+        args.ppmonitor_exe, None, args.port, args.save, ppmonitor_topic, log
+    )
     asyncio.run(daemon.run())
