@@ -28,6 +28,7 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import TextIO
 
 import win32ui  # noqa: F401
@@ -116,8 +117,16 @@ class PinPointDaemon:
                     "PPMonitor is not running and path to its binary was not provided, exiting."
                     "The error was: " + str(ex)
                 )
-            self.log.info("Starting PinPoint monitor: %s", self.ppmonitor_exe)
-            subprocess.Popen([self.ppmonitor_exe])
+            if self.ppmonitor_topic is None:
+                self.log.info("Starting PinPoint monitor: %s", self.ppmonitor_exe)
+                subprocess.Popen([self.ppmonitor_exe])
+            else:
+                name = self.ppmonitor_topic[: self.ppmonitor_topic.index(".")]
+                ppw = Path(self.ppmonitor_exe).parent.joinpath(name, name + ".ppw")
+                self.log.info(
+                    "Starting PinPoint monitor: %s %s", self.ppmonitor_exe, ppw
+                )
+                subprocess.Popen([self.ppmonitor_exe, ppw])
             await asyncio.sleep(5)
             await self.connect()
 
