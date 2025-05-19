@@ -140,9 +140,32 @@ class PinPointDaemon:
         assert self._pin_point is not None
 
         while True:
+            # the last element is empty
             temperatures = self._pin_point.Request("Temperatures").split("\t")[:-1]
             now = time.time()
-            print("Temperatures: ", ",".join(temperatures))
+            units = self._pin_point.Request("Temperature Units")
+            if not (units == "Celsius"):
+                self.log.error(
+                    "Invalid temperature unit - expected Celsius, received %s.", units
+                )
+                sys.exit(1)
+
+            # find no-temp data
+            invalid_temp = True
+            for t in temperatures:
+                if abs(float(t)) > 1e-100:
+                    invalid_temp = False
+            if invalid_temp:
+                self.log.warn("Invalid temperature data: %s", ",".join(temperatures))
+                await asyncio.sleep(self.scan_time)
+                continue
+
+            self.log.info(
+                "Temperatures: %s; units: %s",
+                ",".join(temperatures),
+                units,
+            )
+
             if self.save_file is not None:
                 self.save_file.write(str(now) + ":")
                 self.save_file.write(",".join(temperatures) + "\n")
@@ -152,14 +175,15 @@ class PinPointDaemon:
             for event in self.events:
                 event.set()
 
-            print("Sleep for", self.scan_time)
+            self.log.debug("Sleep for %f seconds.", self.scan_time)
 
             await asyncio.sleep(self.scan_time)
 
     async def handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        self.log.info("Connected %s", writer.get_extra_info("peername"))
+        peername = writer.get_extra_info("peername")
+        self.log.info("Connected %s", peername)
         event = asyncio.Event()
         try:
             self.events.append(event)
@@ -170,6 +194,8 @@ class PinPointDaemon:
                 writer.write(self.data)
                 await writer.drain()
                 event.clear()
+        except ConnectionResetError as ex:
+            self.log.info("Connection to %s lost: %s", peername, str(ex))
         finally:
             self.events.remove(event)
 
@@ -179,7 +205,7 @@ class PinPointDaemon:
             server = await asyncio.start_server(
                 self.handle_client, self.host, self.port
             )
-            self.log.info("Serving")
+            self.log.info("Serving clients.")
             await server.serve_forever()
         except Exception as ex:
             self.log.error("Exception in listen_task: %s", str(ex))
